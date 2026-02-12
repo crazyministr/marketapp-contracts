@@ -1,0 +1,283 @@
+#include "imports/stdlib.fc";
+#include "storage.fc";
+#include "const.fc";
+
+
+builder utils::build_comment(slice comment) inline {
+    return begin_cell().store_uint(0, 32).store_slice(comment);
+}
+
+int math::get_percent(int a, int percent, int factor) inline {
+    if (factor == 0) { return 0; }
+    return muldiv(a, percent, factor);
+}
+
+() send_msg(int mode, slice to_address, int amount, builder payload) impure inline {
+    var msg = begin_cell()
+            .store_uint(0x10, 6)  ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 010000
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    ifnot (builder_null?(payload)) {
+        msg = msg.store_builder(payload);
+    }
+    send_raw_message(msg.end_cell(), mode);
+}
+
+() send_money(slice to_address, int amount, builder payload) impure inline {
+    send_msg(1, to_address, amount, payload);  ;; pay fees separatly, revert on errors
+}
+
+() send_all_money(slice to_address, builder payload) impure inline {
+    send_msg(128, to_address, 0, payload);
+}
+
+() send_nft(int mode, int amount, int nft, slice send_to, slice response_to, int query_id) impure inline {
+    builder nft_transfer = begin_cell()
+        .store_uint(op::nft_transfer, 32)
+        .store_uint(query_id, 64)  ;; query_id
+        .store_slice(send_to)      ;; new_owner_address
+        .store_slice(response_to)  ;; response_address
+        .store_int(0, 1)           ;; empty custom_payload
+        .store_coins(0)            ;; forward amount to new_owner_address 0.00 TON
+        .store_int(0, 1);          ;; empty forward_payload
+
+    var nft_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_uint(2, 2)
+        .store_uint(0, 9)
+        .store_uint(nft, 256)
+        .store_coins(amount)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(nft_transfer.end_cell());
+
+    send_raw_message(nft_msg.end_cell(), mode);
+}
+
+(cell, int) add_nft_if_valid(cell dict, int nft) inline {
+    (slice val, int found?) = dict.udict_get?(256, nft);
+    if (found? == 0) {
+        return (dict, 0);
+    }
+    dict~udict_set_builder(256, nft, begin_cell().store_uint(1, 1));
+    return (dict, -1);
+}
+
+(cell, int, int) add_nfts(cell nfts, cell nfts_to_add, int hold_nfts_cnt, int total_nfts_cnt) inline {
+    if (cell_null?(nfts_to_add)) {
+        return (nfts, hold_nfts_cnt, total_nfts_cnt);
+    }
+
+    int key = -1;
+    do {
+        (key, slice data, int exists) = nfts_to_add.udict_get_next?(256, key);
+        if (exists) {
+            (slice val, int found?) = nfts.udict_get?(256, key);
+            ifnot (found?) {
+                nfts~udict_set_builder(256, key, begin_cell().store_uint(0, 1));
+                total_nfts_cnt += 1;
+                ;; data::hold_nfts_cnt should be incremented on ownership_assigned tx
+            }
+        }
+    } until (~ exists);
+
+    return (nfts, hold_nfts_cnt, total_nfts_cnt);
+}
+
+() send_nft_dict(cell dict, slice send_to, slice response_to, int query_id) impure {
+    int key = -1;
+    do {
+        (key, slice data, int exists) = dict.udict_get_next?(256, key);
+        if (exists) {
+            if (data.preload_uint(1) == 1) {
+                send_nft(1, const::nft_send_amount, key, send_to, response_to, query_id);
+            }
+        }
+    } until (~ exists);
+}
+
+() handle::cancel(cell data::const_cell, cell data::state_cell, cell data::fees_cell) impure {
+    var (data::nfts_owner, data::mp_address, data::create_time) = unpack_const(data::const_cell);
+    var (data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts) = unpack_state(data::state_cell);
+    send_nft_dict(data::nfts, data::nfts_owner, data::nfts_owner, 0);
+    send_all_money(data::nfts_owner, null());  ;; send all money back to the owner
+
+    data::state_cell = pack_state(state::canceled, data::end_time, data::full_price, 0, data::total_nfts_cnt, data::nfts);
+    save_data(data::const_cell, data::state_cell, data::fees_cell);
+}
+
+() handle::buy(slice buyer, int msg_value, cell data::const_cell, cell data::state_cell, cell data::fees_cell) impure {
+    var (data::nfts_owner, data::mp_address, data::create_time) = unpack_const(data::const_cell);
+    var (data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts) = unpack_state(data::state_cell);
+    var (data::mp_fee_address, data::royalty_address, data::mp_fee_factor, data::mp_fee_base, data::royalty_fee_factor, data::royalty_fee_base) = unpack_fees(data::fees_cell);
+
+    int mp_fee = math::get_percent(msg_value, data::mp_fee_factor, data::mp_fee_base);
+    int royalty_fee = math::get_percent(msg_value, data::royalty_fee_factor, data::royalty_fee_base);
+    int profit = msg_value - mp_fee - royalty_fee;
+    throw_unless(err::invalid_profit, profit > 1);
+
+    if (mp_fee > 0) {
+        send_money(data::mp_fee_address, mp_fee, utils::build_comment("Market fee"));
+    }
+    if (royalty_fee > 0) {
+        send_money(data::royalty_address, royalty_fee, utils::build_comment("Royalty"));
+    }
+    send_nft_dict(data::nfts, buyer, data::nfts_owner, 0);
+    send_all_money(data::nfts_owner, utils::build_comment("Profit"));  ;; send all money back to the owner
+
+    data::state_cell = pack_state(state::completed, data::end_time, data::full_price, 0, data::total_nfts_cnt, data::nfts);
+    save_data(data::const_cell, data::state_cell, data::fees_cell);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    var cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { return (); } ;; ignore bounced
+
+    int op = 0;
+    int query_id = 0;
+
+    if (in_msg_body.slice_empty?() == false) {
+        op = in_msg_body~load_uint(32);
+    }
+    if ((op == 0) & (equal_slice_bits(msg::cancel_msg(), in_msg_body))) {
+        ;; make it easy for user to cancel the bundle
+        op = op::cancel;
+    }
+
+    var (data::const_cell, data::state_cell, data::fees_cell) = load_data();
+    var (data::nfts_owner, data::mp_address, data::create_time) = unpack_const(data::const_cell);
+    var (data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts) = unpack_state(data::state_cell);
+
+    if (op == op::deploy) { return (); }
+
+    slice sender_address = cs~load_msg_addr();
+
+    var (wc, sender_address_int) = parse_std_addr(sender_address);
+    throw_unless(err::invalid_workchain, wc == 0);
+
+    if (
+        (op == op::maintenance)
+        & (data::state != state::config)
+        & (data::state != state::ready)
+        & equal_slice_bits(sender_address, data::mp_address)
+    ) {
+        ;; way to fix unexpected troubles with contract
+        var msg = in_msg_body~load_ref().begin_parse();
+        var mode = msg~load_uint(8);
+        throw_if(400, mode & 32);  ;; A-ta-ta, do not remove the contract!
+        send_raw_message(msg~load_ref(), mode);
+        return ();
+    }
+
+    if (op == op::nft_ownership_assigned) {
+        in_msg_body~skip_bits(64);  ;; query_id
+        slice prev_owner = in_msg_body~load_msg_addr();
+        ;; in_msg_body now is forward_payload
+        if (in_msg_body.slice_bits()) {
+            var forward_payload = in_msg_body~load_maybe_ref();
+            ifnot (cell_null?(forward_payload)) {
+                var fwd_msg = forward_payload.begin_parse();
+                prev_owner = fwd_msg~load_msg_addr();  ;; prev_owner from the tx part above may be deployer address
+            }
+        }
+
+        if ((data::state != state::config) | (now() >= data::end_time) | (msg_value < const::min_ton_per_nft)) {
+            send_nft(64, 0, sender_address_int, prev_owner, prev_owner, 1); ;; return nft back
+            return ();
+        }       
+
+        int is_added? = data::nfts~add_nft_if_valid(sender_address_int);
+        if (is_added?) {
+            data::hold_nfts_cnt += 1;
+            if (data::hold_nfts_cnt == data::total_nfts_cnt) {
+                data::state = state::ready;
+            }
+            data::state_cell = pack_state(data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts);
+            save_data(data::const_cell, data::state_cell, data::fees_cell);
+        } else {
+            send_nft(64, 0, sender_address_int, prev_owner, prev_owner, 2);  ;; return nft back
+        }
+        return ();
+    }
+
+    if (op == op::cancel) {
+        throw_unless(err::invalid_state, (data::state == state::ready) | (data::state == state::config));
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nfts_owner));
+        handle::cancel(data::const_cell, data::state_cell, data::fees_cell);
+        return ();
+    }
+
+    if (op == op::update_bundle) {
+        throw_unless(err::invalid_state, (data::state == state::ready) | (data::state == state::config));
+        throw_unless(err::time_is_over, now() < data::end_time);
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nfts_owner));
+
+        int new_price = in_msg_body~load_coins();
+        throw_unless(err::invalid_profit, new_price > 0);
+
+        var nfts_to_add = in_msg_body~load_dict();
+        (data::nfts, data::hold_nfts_cnt, data::total_nfts_cnt) = add_nfts(data::nfts, nfts_to_add, data::hold_nfts_cnt, data::total_nfts_cnt);
+
+        if (data::hold_nfts_cnt == data::total_nfts_cnt) {
+            data::state = state::ready;
+        } elseif (data::hold_nfts_cnt < data::total_nfts_cnt) {
+            data::state = state::config;
+        } else {  ;; should never happen
+            data::state = state::config;
+        }
+
+        data::state_cell = pack_state(data::state, data::end_time, new_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts);
+        save_data(data::const_cell, data::state_cell, data::fees_cell);
+        send_msg(64, sender_address, 0, utils::build_comment("Bundle updated"));
+
+        return ();
+    }
+
+    if ((op == 0) | (op == op::buy)) {
+        throw_unless(err::not_enough_funds, msg_value >= data::full_price);
+        throw_unless(err::invalid_state, data::state == state::ready);
+        throw_unless(err::time_is_over, now() < data::end_time);
+        throw_unless(err::too_many_nfts, data::total_nfts_cnt <= const::max_total_nfts);
+        throw_unless(err::broken_state, data::total_nfts_cnt >= 1);
+        handle::buy(sender_address, msg_value, data::const_cell, data::state_cell, data::fees_cell);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+() recv_external(slice in_msg) impure {
+    int op = in_msg~load_uint(32);
+
+    if (op == op::cancel) {
+        throw_if(4004, slice_refs(in_msg) != 0);
+        throw_if(4005, slice_bits(in_msg) != 0);
+
+        var (data::const_cell, data::state_cell, data::fees_cell) = load_data();
+        var (data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts) = unpack_state(data::state_cell);
+
+        throw_unless(err::invalid_state, (data::state == state::config) | (data::state == state::ready));
+        throw_unless(err::too_early, now() > data::end_time);
+
+        accept_message();
+
+        handle::cancel(data::const_cell, data::state_cell, data::fees_cell);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+_ get_bundle_data() method_id {
+    var (data::const_cell, data::state_cell, data::fees_cell) = load_data();
+    var (data::nfts_owner, data::mp_address, data::create_time) = unpack_const(data::const_cell);
+    var (data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts) = unpack_state(data::state_cell);
+    var (data::mp_fee_address, data::royalty_address, data::mp_fee_factor, data::mp_fee_base, data::royalty_fee_factor, data::royalty_fee_base) = unpack_fees(data::fees_cell);
+    return (
+        data::nfts_owner, data::mp_address, data::create_time,
+        data::state, data::end_time, data::full_price, data::hold_nfts_cnt, data::total_nfts_cnt, data::nfts,
+        data::mp_fee_address, data::royalty_address, data::mp_fee_factor, data::mp_fee_base, data::royalty_fee_factor, data::royalty_fee_base
+    );
+}

@@ -1,0 +1,31 @@
+const int state::config = 0;
+const int state::ready = 1;
+const int state::canceled = 2;
+const int state::completed = 3;
+
+const int const::nft_send_amount = 50000000;  ;; 0.05 TON
+const int const::min_ton_per_nft = 100000000; ;; 0.1 TON
+const int const::max_total_nfts = 100;
+
+const int op::nft_transfer = 0x5fcc3d14;
+const int op::nft_ownership_assigned = 0x05138d91;
+
+const int op::maintenance = 555;
+
+const int op::deploy = 0x664c0905;
+const int op::update_bundle = "update_bundle"c;
+const int op::cancel = "cancel_bundle"c;
+const int op::buy = "buy_bundle"c;
+const int op::completed = "bundle_complete"c;
+
+const int err::invalid_workchain = 1001;
+const int err::not_enough_funds = 1002;
+const int err::invalid_state = 1003;
+const int err::forbidden = 1004;
+const int err::time_is_over = 1005;
+const int err::too_early = 1006;
+const int err::invalid_profit = 1007;
+const int err::broken_state = 1008;
+const int err::too_many_nfts = 1009;
+
+slice msg::cancel_msg() asm "<b 124 word cancel| $, b> <s PUSHSLICE";

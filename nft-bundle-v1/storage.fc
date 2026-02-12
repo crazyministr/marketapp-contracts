@@ -1,0 +1,95 @@
+{-
+    This schema tl-b won't compile but I don't give a shit
+    because this is just for informational purposes
+
+    const_cell$_ nfts_owner: MsgAddressInt
+        mp_address: MsgAddressInt
+        create_time: uint64
+        = ConstCell;
+
+    fees_cell$_ mp_fee_address: MsgAddressInt
+        royalty_address: MsgAddressInt
+        mp_fee_factor: uint32
+        mp_fee_base: uint32
+        royalty_fee_factor: uint32
+        royalty_fee_base: uint32
+        = FeeCell;
+
+    state_cell$_ state: uint3
+        end_time: uint64
+        full_price: Coins
+        hold_nfts_cnt: uint8
+        total_nfts_cnt: uint8
+        nfts: HashMap<uint256, Cell>
+        = StateCell;
+
+    storage$_ 
+        const: ConstCell
+        state: StateCell
+        fees: FeeCell
+    = Storage;
+-}
+
+
+_ load_data() impure {
+    var data = get_data().begin_parse();
+    return (
+        data~load_ref(),  ;; const
+        data~load_ref(),  ;; state
+        data~load_ref()  ;; fees
+    );
+}
+
+() save_data(cell const_cell, cell state_cell, cell fees_cell) impure inline {
+    set_data(
+        begin_cell()
+        .store_ref(const_cell)
+        .store_ref(state_cell)
+        .store_ref(fees_cell)
+        .end_cell()
+    );
+}
+
+_ unpack_state(cell state_cell) inline {
+    var cs = state_cell.begin_parse();
+    return (
+        cs~load_uint(3),  ;; state
+        cs~load_uint(64),  ;; end_time
+        cs~load_coins(),  ;; full_price
+        cs~load_uint(8),  ;; hold_nfts_cnt
+        cs~load_uint(8),  ;; total_nfts_cnt
+        cs~load_dict()  ;; nfts
+    );
+}
+
+_ unpack_const(cell const_cell) inline {
+    var cs = const_cell.begin_parse();
+    return (
+        cs~load_msg_addr(),  ;; nfts_owner
+        cs~load_msg_addr(),  ;; mp_address
+        cs~load_uint(64)  ;; create_time
+    );
+}
+
+_ unpack_fees(cell fees_cell) inline {
+    var cs = fees_cell.begin_parse();
+    return (
+        cs~load_msg_addr(),  ;; mp_fee_address
+        cs~load_msg_addr(),  ;; royalty_address
+        cs~load_uint(32),  ;; mp_fee_factor
+        cs~load_uint(32),  ;; mp_fee_base
+        cs~load_uint(32),  ;; royalty_fee_factor
+        cs~load_uint(32)  ;; royalty_fee_base
+    );
+}
+
+cell pack_state(int state, int end_time, int full_price, int hold_nfts_cnt, int total_nfts_cnt, cell nfts) inline {
+    return begin_cell()
+        .store_uint(state, 3)
+        .store_uint(end_time, 64)
+        .store_coins(full_price)
+        .store_uint(hold_nfts_cnt, 8)
+        .store_uint(total_nfts_cnt, 8)
+        .store_dict(nfts)
+        .end_cell();
+}
