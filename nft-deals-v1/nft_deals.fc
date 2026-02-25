@@ -1,0 +1,226 @@
+#include "imports/stdlib.fc";
+#include "const.fc";
+#include "storage.fc";
+
+builder utils::build_comment(slice comment) inline {
+    return begin_cell().store_uint(0, 32).store_slice(comment);
+}
+
+() send_msg(int mode, slice to_address, int amount, builder payload) impure inline {
+    var msg = begin_cell()
+            .store_uint(0x10, 6)  ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 010000
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    ifnot (builder_null?(payload)) {
+        msg = msg.store_builder(payload);
+    }
+    send_raw_message(msg.end_cell(), mode);
+}
+
+() send_nft(int mode, int amount, int nft, slice send_to, slice response_to, int query_id) impure inline {
+    builder nft_transfer = begin_cell()
+        .store_uint(op::nft_transfer, 32)
+        .store_uint(query_id, 64)  ;; query_id
+        .store_slice(send_to)      ;; new_owner_address
+        .store_slice(response_to)  ;; response_address
+        .store_int(0, 1)           ;; empty custom_payload
+        .store_coins(0)            ;; forward amount to new_owner_address 0.00 TON
+        .store_int(0, 1);          ;; empty forward_payload
+
+    var nft_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_uint(2, 2)
+        .store_uint(0, 9)
+        .store_uint(nft, 256)
+        .store_coins(amount)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(nft_transfer.end_cell());
+
+    send_raw_message(nft_msg.end_cell(), mode);
+}
+
+(cell, int) add_nft_if_valid(cell dict, int nft) inline {
+    (slice val, int found?) = dict.udict_get?(256, nft);
+    if (found? == 0) {
+        return (dict, 0);
+    }
+    dict~udict_set_builder(256, nft, begin_cell().store_uint(1, 1));
+    return (dict, -1);
+}
+
+() send_nft_dict(cell dict, slice send_to, slice response_to, int query_id) impure {
+    int key = -1;
+    do {
+        (key, slice data, int found?) = dict.udict_get_next?(256, key);
+        if (found?) {
+            if (data.preload_uint(1) == 1) {
+                send_nft(1, const::nft_send_amount, key, send_to, response_to, query_id);
+            }
+        }
+    } until (~ found?);
+}
+
+(int) is_deal_completed(int my_balance) inline {
+    return (
+        ;; (now() < state::end_time)  ;; do not check for time, it's overhead
+        (left::paid >= left::surcharge) &
+        (left::hold_nfts_cnt == left::total_nfts_cnt) &
+        (right::paid >= right::surcharge) &
+        (right::hold_nfts_cnt == right::total_nfts_cnt) & 
+        (my_balance > left::paid + right::paid + (left::total_nfts_cnt + right::total_nfts_cnt) * const::nft_send_amount)
+    );
+}
+
+(int) maybe_deal_completed(int my_balance) impure {
+    ifnot (is_deal_completed(my_balance)) { return 0; }
+
+    send_nft_dict(left::nfts, right::address, left::address, 1);
+    send_nft_dict(right::nfts, left::address, right::address, 1);
+
+    int left_profit = (right::surcharge - right::fee) + (left::paid - left::surcharge);
+    if (left_profit > 0) {
+        send_msg(1, left::address, left_profit, utils::build_comment(msg::deal_completed_msg()));
+    }
+    int right_profit = (left::surcharge - left::fee) + (right::paid - right::surcharge);
+    if (right_profit > 0) {
+        send_msg(1, right::address, right_profit, utils::build_comment(msg::deal_completed_msg()));
+    }
+
+    send_msg(128 + 2, mp::fee_address, 0, utils::build_comment(msg::market_fee_msg()));
+
+    state::status = status::completed;
+    return -1;
+}
+
+() handle::cancel(slice reason) impure {
+    send_nft_dict(left::nfts, left::address, left::address, 1);
+    send_nft_dict(right::nfts, right::address, right::address, 1);
+
+    if (right::paid > 0) {
+        send_msg(1 + 2, right::address, right::paid, utils::build_comment(reason));  ;; send to the right first
+    }
+    send_msg(128 + 2, left::address, 0, utils::build_comment(reason));
+    state::status = status::cancelled;
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    var cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) { return (); } ;; ignore bounced
+
+    load_data();
+
+    int op = 0;
+    int query_id = 0;
+
+    if (in_msg_body.slice_empty?() == false) {
+        op = in_msg_body~load_uint(32);
+    }
+    if ((op == 0) & (equal_slice_bits(msg::cancel_msg(), in_msg_body))) {
+        ;; make it easy for user to cancel the deal
+        op = op::cancel;
+    }
+
+    slice sender_address = cs~load_msg_addr();
+    var (_, sender_address_int) = parse_std_addr(sender_address);
+
+    if (op == op::deploy) { return (); }
+
+    if ((op == op::maintenance) & (state::status != status::awaiting) & equal_slice_bits(sender_address, mp::address)) {
+        ;; way to fix unexpected troubles with contract
+        var msg = in_msg_body~load_ref().begin_parse();
+        var mode = msg~load_uint(8);
+        throw_if(400, mode & 32);  ;; A-ta-ta, do not remove the contract!
+        send_raw_message(msg~load_ref(), mode);
+        return ();
+    }
+
+    if (op == op::nft_ownership_assigned) {
+        in_msg_body~skip_bits(64);  ;; query_id
+        slice prev_owner = in_msg_body~load_msg_addr();
+        ;; note: prev_owner from the tx part above may be deployer address
+        ;; in_msg_body now is forward_payload
+        if ((state::status != status::awaiting) | (now() >= state::end_time) | (msg_value < const::min_ton_per_nft)) {
+            send_nft(64, 0, sender_address_int, prev_owner, prev_owner, 1); ;; return nft back
+            return ();
+        }       
+
+        int is_right_added? = 0;
+        int is_left_added? = left::nfts~add_nft_if_valid(sender_address_int);
+        ifnot (is_left_added?) {
+            is_right_added? = right::nfts~add_nft_if_valid(sender_address_int);
+        }
+
+        if (is_left_added?) {
+            left::hold_nfts_cnt += 1;
+            left::paid += msg_value - const::min_ton_per_nft;
+        } elseif (is_right_added?) {
+            right::hold_nfts_cnt += 1;
+            right::paid += msg_value - const::min_ton_per_nft;
+        } else {
+            send_nft(64, 0, sender_address_int, prev_owner, prev_owner, 2);  ;; return nft back
+            return ();
+        }
+
+        maybe_deal_completed(my_balance);
+        return save_data();
+    }
+
+    if (op == op::cancel) {
+        throw_unless(err::invalid_state, state::status == status::awaiting);
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, left::address) | equal_slice_bits(sender_address, right::address));
+        handle::cancel("The deal has been cancelled");
+        return save_data();
+    }
+
+    throw_unless(err::too_late, now() < state::end_time);
+
+    if ((op == 0) | (op == op::surcharge)) {
+        throw_unless(err::invalid_state, state::status == status::awaiting);
+        throw_unless(err::invalid_amount, msg_value >= const::min_ton_for_storage);
+        msg_value -= const::min_ton_for_storage;
+
+        if (equal_slice_bits(sender_address, left::address)) {
+            left::paid += msg_value;
+            throw_unless(err::invalid_amount, left::paid >= left::surcharge);
+        } elseif (equal_slice_bits(sender_address, right::address)) {
+            right::paid += msg_value;
+            throw_unless(err::invalid_amount, right::paid >= right::surcharge);
+        } else {
+            throw(err::unknown_sender);
+        }
+        maybe_deal_completed(my_balance);
+        return save_data();
+    }
+
+    if (op == op::touch) {
+        throw_unless(err::invalid_state, state::status == status::awaiting);
+        maybe_deal_completed(my_balance);
+        return save_data();
+    }
+
+    throw(0xffff);
+}
+
+() recv_external(slice in_msg) impure {
+    int op = in_msg~load_uint(32);
+
+    if (op == op::cancel) {
+        throw_if(4004, slice_refs(in_msg) != 0);
+        throw_if(4005, slice_bits(in_msg) != 0);
+
+        load_data();
+
+        throw_unless(err::invalid_state, state::status == status::awaiting);
+        throw_unless(err::too_early, now() > state::end_time);
+
+        accept_message();
+
+        handle::cancel("The deal has expired");
+        return save_data();
+    }
+
+    throw(0xffff);
+}

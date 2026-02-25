@@ -1,0 +1,129 @@
+{-
+    # Storage
+
+    left_trader_cell$_
+        left_address: MsgAddressInt
+        left_surcharge: Coins
+        left_paid: Coins
+        left_fee: Coins
+        left_hold_nfts_cnt: uint8
+        left_total_nfts_cnt: uint8
+        left_nfts: (HashmapE 256 Bool)
+    = LeftTraderCell;
+
+    right_trader_cell$_
+        right_address: MsgAddressInt
+        right_surcharge: Coins
+        right_paid: Coins
+        right_fee: Coins
+        right_hold_nfts_cnt: uint8
+        right_total_nfts_cnt: uint8
+        right_nfts: (HashmapE 256 Bool)
+    = RightTraderCell;
+
+    mp_cell$_
+        mp_address: MsgAddressInt
+        mp_fee_address: MsgAddressInt
+    = ConstCell;
+
+    storage$_ 
+        status: uint2  ;; 0: awaiting, 1: completed, 2: cancelled
+        create_time: uint64
+        end_time: uint64
+        left_trader: LeftTraderCell
+        right_trader: RightTraderCell
+        mp: ConstCell
+    = Storage;
+-}
+
+global int state::status;
+global int state::create_time;
+global int state::end_time;
+
+global slice left::address;
+global int left::surcharge;
+global int left::paid;
+global int left::fee;
+global int left::hold_nfts_cnt;
+global int left::total_nfts_cnt;
+global cell left::nfts;
+
+global slice right::address;
+global int right::surcharge;
+global int right::paid;
+global int right::fee;
+global int right::hold_nfts_cnt;
+global int right::total_nfts_cnt;
+global cell right::nfts;
+
+global slice mp::address;
+global slice mp::fee_address;
+
+
+_ load_data() impure {
+    var ds = get_data().begin_parse();
+
+    state::status = ds~load_uint(2);
+    state::create_time = ds~load_uint(64);
+    state::end_time = ds~load_uint(64);
+
+    slice left = ds~load_ref().begin_parse();
+    left::address = left~load_msg_addr();
+    left::surcharge = left~load_coins();
+    left::paid = left~load_coins();
+    left::fee = left~load_coins();
+    left::hold_nfts_cnt = left~load_uint(8);
+    left::total_nfts_cnt = left~load_uint(8);
+    left::nfts = left~load_dict();
+
+    slice right = ds~load_ref().begin_parse();
+    right::address = right~load_msg_addr();
+    right::surcharge = right~load_coins();
+    right::paid = right~load_coins();
+    right::fee = right~load_coins();
+    right::hold_nfts_cnt = right~load_uint(8);
+    right::total_nfts_cnt = right~load_uint(8);
+    right::nfts = right~load_dict();
+
+    slice mp = ds~load_ref().begin_parse();
+    mp::address = mp~load_msg_addr();
+    mp::fee_address = mp~load_msg_addr();
+}
+
+_ save_data() impure {
+    set_data(
+        begin_cell()
+        .store_uint(state::status, 2)
+        .store_uint(state::create_time, 64)
+        .store_uint(state::end_time, 64)
+        .store_ref(
+            begin_cell()
+            .store_slice(left::address)
+            .store_coins(left::surcharge)
+            .store_coins(left::paid)
+            .store_coins(left::fee)
+            .store_uint(left::hold_nfts_cnt, 8)
+            .store_uint(left::total_nfts_cnt, 8)
+            .store_dict(left::nfts)
+            .end_cell()
+        )
+        .store_ref(
+            begin_cell()
+            .store_slice(right::address)
+            .store_coins(right::surcharge)
+            .store_coins(right::paid)
+            .store_coins(right::fee)
+            .store_uint(right::hold_nfts_cnt, 8)
+            .store_uint(right::total_nfts_cnt, 8)
+            .store_dict(right::nfts)
+            .end_cell()
+        )
+        .store_ref(
+            begin_cell()
+            .store_slice(mp::address)
+            .store_slice(mp::fee_address)
+            .end_cell()
+        )
+        .end_cell()
+    );
+}
