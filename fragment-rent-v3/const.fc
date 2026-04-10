@@ -1,0 +1,50 @@
+const int status::not_rented = 0;
+const int status::rented = 1;
+const int status::canceled = 2;
+const int status::completed = 3;
+const int status::rented_out = 4;
+const int status::sold = 5;
+
+const int smc_type::for_rent = 0;  ;; parent
+const int smc_type::rented = 1;    ;; child
+
+const int op::nft::transfer = 0x5fcc3d14;
+
+const int op::deploy = 0x664c0905;
+const int op::deploy_rented = "op::deploy_rented"c;
+const int op::update = "op::update"c;
+const int op::rent = "op::rent"c;
+const int op::cancel = "op::cancel"c;
+const int op::complete = "op::complete"c;
+const int op::rent_out_repeat = "op::rent_out_repeat"c;
+const int op::turn_off_auto_rent_out = "op::turn_off_auto_rent_out"c;
+const int op::set_auto_rent_out = "op::set_auto_rent_out"c;
+const int op::buy_now = "op::buy_now"c;
+const int op::extend_rent = "op::extend_rent"c;
+const int op::maintenance = 555;
+
+slice msg::cancel_msg() asm "<b 124 word cancel| $, b> <s PUSHSLICE";
+slice msg::complete_msg() asm "<b 124 word complete| $, b> <s PUSHSLICE";
+slice msg::renter_excess_msg() asm "<b 124 word Thx for your rent on marketapp.ws| $, b> <s PUSHSLICE";
+slice msg::rented_msg() asm "<b 124 word Rented out on marketapp.ws| $, b> <s PUSHSLICE";
+slice msg::market_fee_msg() asm "<b 124 word Market fee| $, b> <s PUSHSLICE";
+slice msg::extended_rent_msg() asm "<b 124 word Extended rent| $, b> <s PUSHSLICE";
+slice msg::rent_settings_updated_msg() asm "<b 124 word Rent settings has been updated| $, b> <s PUSHSLICE";
+slice msg::rental_period_extended_msg() asm "<b 124 word Rental period has been extended| $, b> <s PUSHSLICE";
+slice msg::sold_msg() asm "<b 124 word Sold on marketapp.ws| $, b> <s PUSHSLICE";
+
+const int err::invalid_status = 1001;
+const int err::forbidden = 1002;
+const int err::not_enough_funds = 1003;
+const int err::too_early = 1004;
+const int err::too_late = 1005;
+const int err::invalid_duration = 1006;
+const int err::invalid_signed_timestamp = 1007;
+const int err::invalid_price = 1008;
+const int err::invalid_smc_type = 1009;
+const int err::invalid_rent_cost = 1010;
+const int err::not_for_sale = 1011;
+
+const int const::min_tons_for_rent = 200000000;  ;; 0.2 TON
+const int const::rent_out_repeat_value = 20000000;  ;; 0.02 TON
+const int const::deploy_value = 50000000;  ;; 0.05 TON

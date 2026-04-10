@@ -1,0 +1,456 @@
+#include "imports/stdlib.fc";
+#include "const.fc";
+#include "storage.fc";
+
+
+cell calculate_state_init(cell data) inline {
+    return begin_cell()
+        .store_uint(0, 2)  ;; 0b00 - No split_depth; No special
+        .store_maybe_ref(my_code())
+        .store_maybe_ref(data)
+        .store_uint(0, 1)  ;; Empty libraries
+    .end_cell();
+}
+
+slice calculate_address(cell state_init) inline {
+    {-
+    https://github.com/ton-blockchain/ton/blob/8a9ff339927b22b72819c5125428b70c406da631/crypto/block/block.tlb#L105
+    addr_std$10 anycast:(Maybe Anycast) workchain_id:int8 address:bits256  = MsgAddressInt;
+    -}
+    return begin_cell()
+        .store_uint(4, 3) ;; 0b100 = addr_std$10 tag; No anycast
+        .store_int(0, 8)
+        .store_uint(cell_hash(state_init), 256)
+    .end_cell()
+    .begin_parse();
+}
+
+int math::is_duration_days(int duration) inline {
+    return (duration >= 86400) & (duration <= 86400 * 365) & (duration % 86400 == 0);
+}
+
+int math::get_percent(int a, int percent, int factor) inline {
+    if (factor == 0) { return 0; }
+    return muldiv(a, percent, factor);
+}
+
+int math::calc_rent_cost(int price_per_day, int duration, int discount_pd_factor, int discount_pd_base, int max_discount_pd_factor) inline {
+    int rent_cost = muldiv(price_per_day, duration, 86400);
+    if ((discount_pd_factor == 0) | (max_discount_pd_factor == 0)) { return rent_cost; }
+
+    int extra_days = (duration - 86400) / 86400;
+    if (extra_days <= 0) { return rent_cost; }
+
+    discount_pd_factor *= extra_days;
+    if (discount_pd_factor > max_discount_pd_factor) {
+        discount_pd_factor = max_discount_pd_factor;
+    }
+    int discount = math::get_percent(rent_cost, discount_pd_factor, discount_pd_base);
+    rent_cost -= discount;
+
+    throw_unless(err::invalid_rent_cost, rent_cost > 0);
+    return rent_cost;
+}
+
+() send_nft(int mode, int amount, slice nft_address, slice send_to, slice response_to, int query_id) impure inline {
+    builder nft_transfer = begin_cell()
+        .store_uint(op::nft::transfer, 32)
+        .store_uint(query_id, 64)  ;; query_id
+        .store_slice(send_to)      ;; new_owner_address
+        .store_slice(response_to)  ;; response_address
+        .store_int(0, 1)           ;; empty custom_payload
+        .store_coins(0)            ;; forward amount to new_owner_address 0.00 TON
+        .store_int(0, 1);          ;; empty forward_payload
+
+    var nft_msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(nft_address)
+        .store_coins(amount)
+        .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .store_ref(nft_transfer.end_cell());
+
+    send_raw_message(nft_msg.end_cell(), mode);
+}
+
+() send_msg(int mode, slice to_address, int amount, builder payload) impure inline {
+    var msg = begin_cell()
+            .store_uint(0x10, 6)  ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 010000
+            .store_slice(to_address)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1);
+
+    ifnot (builder_null?(payload)) {
+        msg = msg.store_builder(payload);
+    }
+    send_raw_message(msg.end_cell(), mode);
+}
+
+slice deploy_rented_vault(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key) impure {
+    cell data = begin_cell()
+        .store_ref(const_cell)
+        .store_ref(state_cell)
+        .store_ref(config_cell)
+        .store_ref(fees_cell)
+        .store_uint(public_key, 256)
+    .end_cell();
+
+    cell state_init = calculate_state_init(data);
+    slice new_contract_address = calculate_address(state_init);
+
+    ;; https://docs.ton.org/v3/documentation/smart-contracts/message-management/sending-messages/#message-layout
+    cell deploy_message = begin_cell()
+        .store_uint(0x10, 6) ;; nobounce
+        .store_slice(new_contract_address)
+        .store_coins(const::deploy_value)
+        .store_uint(4 + 2, 1 + 4 + 4 + 64 + 32 + 1 + 1 + 1)
+        .store_ref(state_init)
+        .store_uint(op::deploy_rented, 32)
+        .end_cell();
+    send_raw_message(deploy_message, 1);
+    return new_contract_address;
+}
+
+() handle::update(
+    cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key,
+    int new_is_auto_rent_out, int new_min_duration, int new_max_duration, int new_price_per_day, int new_discount_pd_factor, int new_discount_pd_base, int new_max_discount_pd_factor, int new_sale_price
+) impure {
+    config_cell = pack_config(new_is_auto_rent_out, new_min_duration, new_max_duration, new_price_per_day, new_discount_pd_factor, new_discount_pd_base, new_max_discount_pd_factor, new_sale_price);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() handle::cancel(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent) = unpack_state(state_cell);
+
+    send_nft(128, 0, data::nft_address, data::nft_owner, data::nft_owner, 13);
+
+    state_cell = pack_state(status::canceled, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() handle::complete(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent) = unpack_state(state_cell);
+
+    if (data::smc_type == smc_type::for_rent) {
+        ;; means return to owner cuz this is initial smc for rent
+        send_nft(128, 0, data::nft_address, data::nft_owner, data::nft_owner, 35);
+        state_cell = pack_state(status::completed, 0, 0, 0, address_none(), address_none());
+        save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+        return ();
+    }
+
+    send_msg(1, data::smc_for_rent, const::rent_out_repeat_value, begin_cell().store_uint(op::rent_out_repeat, 32).store_ref(config_cell));
+    send_nft(128, 0, data::nft_address, data::smc_for_rent, data::rented_by, 34);
+    state_cell = pack_state(status::completed, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() handle::rent_out_repeat(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key, slice sender_address, slice msg_payload) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_rented_address) = unpack_state(state_cell);
+
+    throw_unless(err::forbidden, equal_slice_bits(data::smc_rented_address, sender_address));
+
+    cell new_config_cell = msg_payload~load_ref();
+    var (new_is_auto_rent_out, new_min_duration, new_max_duration, new_price_per_day, new_discount_pd_factor, new_discount_pd_base, new_max_discount_pd_factor, new_sale_price) = unpack_config(new_config_cell);
+
+    int new_status = status::rented;
+    if (new_is_auto_rent_out) {
+        new_status = status::not_rented;
+    }
+    state_cell = pack_state(new_status, 0, 0, 0, address_none(), address_none());
+    save_data(const_cell, state_cell, new_config_cell, fees_cell, public_key);
+    send_msg(64, data::rented_by, 0, begin_cell().store_uint(0, 32).store_slice(msg::renter_excess_msg()));
+}
+
+() handle::set_auto_rent_out(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key, int new_is_auto_rent_out) impure {
+    var (_, data::min_duration, data::max_duration, data::price_per_day, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor, data::sale_price) = unpack_config(config_cell);
+    config_cell = pack_config(new_is_auto_rent_out, data::min_duration, data::max_duration, data::price_per_day, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor, data::sale_price);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+int distribute_fees(int rent_cost, slice data::mp_fee_address, int data::mp_fee_factor, int data::mp_fee_base, slice msg_payload) impure {
+    int mp_fee = math::get_percent(rent_cost, data::mp_fee_factor, data::mp_fee_base);
+    if (mp_fee > 0) {
+        if (~ msg_payload.slice_empty?()) {
+            cell refferal? = msg_payload~load_maybe_ref();
+            if (~ refferal?.cell_null?()) {
+                slice ref_cs = refferal?.begin_parse();
+                var (ref_address, factor, base) = (ref_cs~load_msg_addr(), ref_cs~load_uint(32), ref_cs~load_uint(32));
+                int ref_amount = math::get_percent(mp_fee, factor, base);
+                if ((mp_fee > ref_amount) & (ref_amount > 0)) {
+                    mp_fee -= ref_amount;
+                    rent_cost -= ref_amount;
+                    send_msg(1, ref_address, ref_amount, begin_cell().store_slice(ref_cs));
+                }
+            }
+        }
+        rent_cost -= mp_fee;
+        send_msg(1, data::mp_fee_address, mp_fee, begin_cell().store_uint(0, 32).store_slice(msg::market_fee_msg()));
+    }
+    throw_unless(err::invalid_rent_cost, rent_cost > 0);
+    return rent_cost;
+}
+
+() handle::rent(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key, slice sender_address, int msg_value, slice msg_payload) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::is_auto_rent_out, data::min_duration, data::max_duration, data::price_per_day, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor, data::sale_price) = unpack_config(config_cell);
+    var (data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base) = unpack_fees(fees_cell);
+
+    (int msg::price_per_day, int msg::duration) = (msg_payload~load_coins(), msg_payload~load_uint(32));
+    throw_unless(err::invalid_duration, (msg::duration >= data::min_duration) & (msg::duration <= data::max_duration));
+    throw_unless(err::invalid_price, msg::price_per_day == data::price_per_day);
+    int rent_cost = math::calc_rent_cost(msg::price_per_day, msg::duration, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor);
+    throw_unless(err::not_enough_funds, msg_value >= rent_cost + const::min_tons_for_rent);
+
+    int user_public_key = msg_payload~load_uint(256);
+
+    rent_cost = distribute_fees(rent_cost, data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base, msg_payload);
+    send_msg(1, data::nft_owner, rent_cost, begin_cell().store_uint(0, 32).store_slice(msg::rented_msg()));
+
+    int create_time = now();
+    slice smc_rented_address = deploy_rented_vault(
+        pack_const(data::nft_owner, data::nft_address, data::mp_address, create_time, smc_type::rented),
+        pack_state(status::rented, msg::duration, create_time + msg::duration, msg::price_per_day, sender_address, my_address()),
+        config_cell,
+        fees_cell,
+        user_public_key
+    );
+    raw_reserve(0, 4);
+    send_nft(128, 0, data::nft_address, smc_rented_address, sender_address, 14);
+
+    state_cell = pack_state(status::rented_out, msg::duration, create_time + msg::duration, msg::price_per_day, sender_address, smc_rented_address);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() handle::extend_rent(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key, int msg_value, slice msg_payload) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::status, data::duration, data::end_time, _, data::rented_by, data::smc_for_rent) = unpack_state(state_cell);
+    var (data::is_auto_rent_out, data::min_duration, data::max_duration, data::price_per_day, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor, data::sale_price) = unpack_config(config_cell);
+    var (data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base) = unpack_fees(fees_cell);
+
+    (int msg::price_per_day, int msg::duration) = (msg_payload~load_coins(), msg_payload~load_uint(32));
+    int total_duration = msg::duration + data::duration;
+    throw_unless(err::invalid_duration, (total_duration >= data::min_duration) & (total_duration <= data::max_duration));
+    throw_unless(err::invalid_price, msg::price_per_day == data::price_per_day);
+    int rent_cost = math::calc_rent_cost(msg::price_per_day, msg::duration, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor);
+    throw_unless(err::not_enough_funds, msg_value >= rent_cost + const::min_tons_for_rent);
+
+    rent_cost = distribute_fees(rent_cost, data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base, msg_payload);
+    send_msg(1, data::nft_owner, rent_cost, begin_cell().store_uint(0, 32).store_slice(msg::extended_rent_msg()));
+
+    state_cell = pack_state(data::status, total_duration, data::end_time + msg::duration, data::price_per_day, data::rented_by, data::smc_for_rent);
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() handle::buy_now(cell const_cell, cell state_cell, cell config_cell, cell fees_cell, int public_key, slice sender_address, int msg_value, slice msg_payload) impure {
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(const_cell);
+    var (data::status, data::duration, data::end_time, _, data::rented_by, data::smc_for_rent) = unpack_state(state_cell);
+    var (data::is_auto_rent_out, data::min_duration, data::max_duration, data::price_per_day, data::discount_pd_factor, data::discount_pd_base, data::max_discount_pd_factor, data::sale_price) = unpack_config(config_cell);
+    var (data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base) = unpack_fees(fees_cell);
+
+    throw_unless(err::invalid_status, data::status == status::not_rented);
+    throw_unless(err::invalid_smc_type, data::smc_type == smc_type::for_rent);
+    throw_unless(err::not_for_sale, data::sale_price > 0);
+    throw_unless(err::not_enough_funds, msg_value >= data::sale_price + const::min_tons_for_rent);
+
+    int sale_cost = distribute_fees(data::sale_price, data::mp_fee_address, data::mp_fee_factor, data::mp_fee_base, begin_cell().end_cell().begin_parse());
+    send_msg(1, data::nft_owner, sale_cost, begin_cell().store_uint(0, 32).store_slice(msg::sold_msg()));
+    send_nft(128, 0, data::nft_address, sender_address, sender_address, 34);
+
+    state_cell = pack_state(status::sold, 0, 0, 0, address_none(), address_none());
+    save_data(const_cell, state_cell, config_cell, fees_cell, public_key);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { return (); }
+
+    int op = 0;
+    if (in_msg_body.slice_empty?() == false) {
+        op = in_msg_body~load_uint(32);
+    }
+
+    if (op == op::deploy_rented) { return (); }
+    if (op == op::deploy) { return (); }
+
+    if (op == 0) {
+        ;; make it easy for user to handle some request just in case
+        if (equal_slice_bits(msg::cancel_msg(), in_msg_body)) {
+            op = op::cancel;
+        } elseif (equal_slice_bits(msg::complete_msg(), in_msg_body)) {
+            op = op::complete;
+        }
+    }
+
+    var (data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key) = load_data();
+    var (data::nft_owner, data::nft_address, data::mp_address, data::create_time, data::smc_type) = unpack_const(data::const_cell);
+    var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent) = unpack_state(data::state_cell);
+
+    slice sender_address = cs~load_msg_addr();
+    if (
+        (op == op::maintenance) & equal_slice_bits(sender_address, data::mp_address) & (data::status != status::not_rented) & (data::status != status::rented)
+    ) { ;; its ok for maintenance on config state
+        ;; way to fix unexpected troubles with contract
+        var msg = in_msg_body~load_ref().begin_parse();
+        var mode = msg~load_uint(8);
+        throw_if(400, mode & 32);  ;; A-ta-ta, do not remove the contract!
+        send_raw_message(msg~load_ref(), mode);
+        return ();
+    }
+
+    if (op == op::complete) {
+        throw_unless(err::invalid_status, data::status == status::rented);
+        throw_unless(err::too_early, now() > data::end_time);
+
+        handle::complete(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key);
+        return ();
+    }
+
+    if (op == op::rent_out_repeat) {
+        throw_unless(err::invalid_status, data::status == status::rented_out);
+        handle::rent_out_repeat(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, sender_address, in_msg_body);
+        return ();
+    }
+
+    if (op == op::turn_off_auto_rent_out) {
+        throw_if(err::invalid_status, (data::status == status::canceled) | (data::status == status::completed));
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nft_owner));
+        handle::set_auto_rent_out(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, 0);
+        send_msg(64, sender_address, 0, begin_cell().store_uint(0, 32).store_slice(msg::rent_settings_updated_msg()));
+        return ();
+    }
+
+    if (op == op::set_auto_rent_out) {
+        throw_if(err::invalid_status, (data::status == status::canceled) | (data::status == status::completed));
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nft_owner));
+        handle::set_auto_rent_out(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, in_msg_body~load_uint(1));
+        send_msg(64, sender_address, 0, begin_cell().store_uint(0, 32).store_slice(msg::rent_settings_updated_msg()));
+        return ();
+    }
+
+    if (op == op::update) {
+        throw_unless(err::invalid_status, (data::status == status::not_rented) | (data::status == status::rented));
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nft_owner));
+        if ((data::status == status::rented) & (data::end_time < now())) {
+            handle::complete(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key);
+            return ();
+        }
+
+        var (
+            is_auto_rent_out,
+            new_min_duration, new_max_duration,
+            new_price_per_day,
+            new_discount_pd_factor, new_discount_pd_base,
+            new_max_discount_pd_factor,
+            new_sale_price
+        ) = (
+            in_msg_body~load_uint(1),
+            in_msg_body~load_uint(32), in_msg_body~load_uint(32),
+            in_msg_body~load_coins(),
+            in_msg_body~load_uint(32), in_msg_body~load_uint(32),
+            in_msg_body~load_uint(32),
+            in_msg_body~load_coins()
+        );
+        throw_unless(
+            err::invalid_duration,
+            (new_min_duration <= new_max_duration) & math::is_duration_days(new_min_duration) & math::is_duration_days(new_max_duration)
+        );
+        throw_unless(err::invalid_price, new_price_per_day > 0);
+
+        handle::update(
+            data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key,
+            is_auto_rent_out, new_min_duration, new_max_duration, new_price_per_day, new_discount_pd_factor, new_discount_pd_base, new_max_discount_pd_factor, new_sale_price
+        );
+        send_msg(64, sender_address, 0, begin_cell().store_uint(0, 32).store_slice(msg::rent_settings_updated_msg()));
+        return ();
+    }
+
+    if (op == op::cancel) {
+        throw_unless(err::invalid_status, data::status == status::not_rented);
+        throw_unless(err::forbidden, equal_slice_bits(sender_address, data::nft_owner));
+        handle::cancel(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key);
+        return ();
+    }
+
+    if (op == op::rent) {
+        throw_unless(err::invalid_status, data::status == status::not_rented);
+
+        var signature = in_msg_body~load_bits(512);
+        throw_unless(403, check_signature(slice_hash(in_msg_body), signature, data::public_key));
+
+        handle::rent(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, sender_address, msg_value, in_msg_body);
+        return ();
+    }
+
+    if (op == op::extend_rent) {
+        throw_unless(err::invalid_status, data::status == status::rented);
+        throw_unless(err::invalid_smc_type, data::smc_type == smc_type::rented);
+        throw_unless(err::too_late, now() < data::end_time);
+
+        ;; lets allow anyone to extend rent
+        ;; throw_unless(err::forbidden, equal_slice_bits(sender_address, data::rented_by));
+
+        var signature = in_msg_body~load_bits(512);
+        throw_unless(403, check_signature(slice_hash(in_msg_body), signature, data::public_key));
+
+        handle::extend_rent(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, msg_value, in_msg_body);
+        raw_reserve(0, 4);
+        send_msg(128, sender_address, 0, begin_cell().store_uint(0, 32).store_slice(msg::rental_period_extended_msg()));
+        return ();
+    }
+
+    if (op == op::buy_now) {
+        handle::buy_now(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, sender_address, msg_value, in_msg_body);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+() recv_external(slice in_msg) impure {
+    int op = in_msg~load_uint(32);
+
+    if (op == op::complete) {
+        throw_if(4004, slice_refs(in_msg) != 0);
+        throw_if(4005, slice_bits(in_msg) != 0);
+
+        var (data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key) = load_data();
+        var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent) = unpack_state(data::state_cell);
+
+        throw_unless(err::invalid_status, data::status == status::rented);
+        throw_unless(err::too_early, now() > data::end_time);
+
+        accept_message();
+
+        handle::complete(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key);
+        return ();
+    }
+
+    if (op == op::turn_off_auto_rent_out) {
+        var (data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key) = load_data();
+        var (data::status, data::duration, data::end_time, data::price_per_day, data::rented_by, data::smc_for_rent) = unpack_state(data::state_cell);
+        throw_if(err::invalid_status, (data::status == status::canceled) | (data::status == status::completed));
+
+        var signature = in_msg~load_bits(512);
+        throw_unless(403, check_signature(slice_hash(in_msg), signature, data::public_key));
+
+        int ts = in_msg~load_uint(64);
+        throw_unless(err::invalid_signed_timestamp, abs(ts - now()) <= 2 * 60);
+
+        accept_message();
+
+        handle::set_auto_rent_out(data::const_cell, data::state_cell, data::config_cell, data::fees_cell, data::public_key, 0);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+int get_public_key() method_id {
+    (_, _, _, _, int public_key) = load_data();
+    return public_key;
+}
